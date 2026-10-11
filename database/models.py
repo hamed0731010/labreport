@@ -55,8 +55,8 @@ class ExtractionSchema(Base):
 class ExtractionRequest(Base):
     __tablename__ = "lab_report_extraction_requests"
     __table_args__ = (
-        CheckConstraint("retry_count >= 0 AND retry_count <= 3", name="chk_retry_count"),
-        Index("idx_requests_polling", "created_at", postgresql_where=(func.lower("status") == "uploaded")),
+        CheckConstraint("retry_count >= 0", name="chk_retry_count"),
+        Index("idx_requests_lease_expiry", "lease_expires_at"),
         Index("idx_requests_status_created_at", "status", "created_at"),
     )
 
@@ -84,6 +84,10 @@ class ExtractionRequest(Base):
     ocr_metadata: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSONB)
     retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     last_error_message: Mapped[Optional[str]] = mapped_column(Text)
+    next_retry_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    lease_token: Mapped[Optional[str]] = mapped_column(String(36))
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    queue_managed: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true(), nullable=False)
     
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

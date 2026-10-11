@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from src.api.router import public_router
 from src.core.config import (
     APP_NAME,
+    MAX_JOBS_PER_DRAIN,
     APP_VERSION,
     CORS_ALLOW_ORIGINS,
     LLM_POLL_INTERVAL_SECONDS,
@@ -14,6 +15,7 @@ from src.core.config import (
     LOG_LEVEL,
     OCR_POLL_INTERVAL_SECONDS,
 )
+from src.service.job_leases import recover_expired_jobs
 from src.workers.tasks import task_process_llm, task_process_ocr
 from src.service.queue_scheduler import (
     configure_queue_handlers,
@@ -30,7 +32,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 async def _drain_ocr_queue() -> None:
-    while True:
+    await recover_expired_jobs()
+    for _ in range(MAX_JOBS_PER_DRAIN):
         result = await task_process_ocr()
         if result == "empty":
             return
@@ -42,8 +45,9 @@ async def _drain_ocr_queue() -> None:
 
 async def _drain_llm_queue() -> None:
     # A fixed cutoff visits each eligible row at most once per drain.
+    await recover_expired_jobs()
     cutoff = datetime.now(timezone.utc)
-    for _ in range(25):
+    for _ in range(MAX_JOBS_PER_DRAIN):
         result = await task_process_llm(eligible_before=cutoff)
         if result != "done":
             return

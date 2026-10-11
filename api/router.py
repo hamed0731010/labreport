@@ -24,6 +24,9 @@ from src.database.models import (
 )
 
 from src.service.extraction_pipeline import run_extraction_pipeline
+from src.service.job_leases import (
+    assign_lease, clear_lease, heartbeat, mark_job_failed, owns_lease, stop_heartbeat,
+)
 from src.service.minio_storage import image_storage
 from src.api.schema import (
     AsyncAcceptedResponse,
@@ -180,7 +183,7 @@ async def extract_image_sync(
 
     image_id, object_name = await image_storage.store_upload(file)
 
-    # 2. Register the job row up front, same schema as the async path
+    # A sync request must never appear in the background queue.
     new_request = ExtractionRequest(
         image_id=image_id,
         minio_path=object_name,
@@ -188,16 +191,16 @@ async def extract_image_sync(
         prompt_id=prompt_obj.id if prompt_obj else None,
         schema_id=schema_obj.id if schema_obj else None,
         lm_model=llm_model if use_llm else None,
-        status=ExtractionStatus.UPLOADED,
+        status=ExtractionStatus.OCR_PROCESSING,
+        queue_managed=False,
     )
+    token = assign_lease(new_request)
     session.add(new_request)
-    await session.commit()
-    await session.refresh(new_request)
-
-    # 3. Run extraction *inline* — no queue, no background worker
-    new_request.status = ExtractionStatus.OCR_PROCESSING
+    await session.flush()
+    request_id = new_request.id
     await session.commit()
 
+    lease_task = asyncio.create_task(heartbeat(request_id, token))
     try:
         pipeline_output = await run_extraction_pipeline(
             object_name=object_name,
@@ -207,46 +210,52 @@ async def extract_image_sync(
             schema_obj=schema_obj,
         )
 
+        # Refresh under a lock: recovery may have invalidated our ownership.
+        new_request = (await session.execute(
+            select(ExtractionRequest)
+            .where(ExtractionRequest.id == request_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )).scalar_one()
+        if not owns_lease(new_request, token, ExtractionStatus.OCR_PROCESSING):
+            raise HTTPException(status_code=409, detail="Processing lease expired; check request status")
+
         new_response = ExtractionResponse(
-            request_id=new_request.id,
+            request_id=request_id,
             result_json=pipeline_output["result_json"],
             raw_llm_output=pipeline_output.get("raw_llm_output"),
         )
         session.add(new_response)
-
+        new_request.ocr_raw_text = pipeline_output.get("ocr_result")
         new_request.status = ExtractionStatus.COMPLETED
         new_request.updated_at = datetime.now(timezone.utc)
+        new_request.last_error_message = None
+        clear_lease(new_request)
         await session.commit()
 
-        logger.info(f"Sync extraction completed. Request ID: {new_request.id}")
-
+        logger.info("Sync extraction completed. Request ID: %s", request_id)
         return {
-            "request_id": new_request.id,
+            "request_id": request_id,
             "status": "completed",
-            "result": new_response.result_json,
+            "result": pipeline_output["result_json"],
             "ocr_result": pipeline_output.get("ocr_result"),
-            "raw_llm_output": new_response.raw_llm_output,
+            "raw_llm_output": pipeline_output.get("raw_llm_output"),
         }
-
-    except Exception as e:
-        logger.error(f"Sync extraction failed for request {request_id}: {e}", exc_info=True)
+    except HTTPException:
         await session.rollback()
-
-        try:
-            failed_request = await session.get(ExtractionRequest, request_id)
-            if failed_request is not None:
-                failed_request.status = ExtractionStatus.FAILED
-                failed_request.last_error_message = str(e)
-                failed_request.updated_at = datetime.now(timezone.utc)
-                await session.commit()
-        except Exception:
-            await session.rollback()
-            logger.exception(
-                "Could not save failed status for sync extraction request %s",
-                request_id,
-            )
-
-        raise HTTPException(status_code=500, detail="Extraction failed") from e
+        raise
+    except asyncio.CancelledError:
+        # to_thread cannot stop the underlying call. Leave ownership to expire;
+        # recovery marks sync requests failed instead of enqueueing them.
+        await session.rollback()
+        raise
+    except Exception as error:
+        logger.exception("Sync extraction failed for request %s", request_id)
+        await session.rollback()
+        await mark_job_failed(request_id, str(error), ExtractionStatus.UPLOADED, token)
+        raise HTTPException(status_code=500, detail="Extraction failed") from error
+    finally:
+        await stop_heartbeat(lease_task)
 
 
 # ==========================================
@@ -265,7 +274,8 @@ async def get_extraction_status(request_id: int, session: AsyncSession = Depends
         "status": req.status.value,
         "retry_count": req.retry_count,
         "created_at": req.created_at,
-        "updated_at": req.updated_at
+        "updated_at": req.updated_at,
+        "next_retry_at": req.next_retry_at,
     }
 
     if req.status == ExtractionStatus.OCR_COMPLETED and req.use_lm:
