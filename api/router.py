@@ -24,6 +24,7 @@ from src.database.models import (
 )
 
 from src.service.extraction_pipeline import run_extraction_pipeline
+from src.service.sync_rate_limit import enforce_sync_rate_limit
 from src.service.job_leases import (
     assign_lease, clear_lease, heartbeat, mark_job_failed, owns_lease, stop_heartbeat,
 )
@@ -181,6 +182,11 @@ async def extract_image_sync(
     if use_llm:
         prompt_obj, schema_obj = await resolve_prompt_and_schema(session, llm_prompt, schema_name)
 
+    # Admit before image storage, request registration or expensive computation.
+    # Release the prompt/schema read connection before opening the limiter's
+    # independent transaction (the app session uses expire_on_commit=False).
+    await session.commit()
+    await enforce_sync_rate_limit()
     image_id, object_name = await image_storage.store_upload(file)
 
     # A sync request must never appear in the background queue.

@@ -22,6 +22,8 @@ Successful sync OCR text is also available from the status endpoint.
    mark known abandoned sync requests failed before restarting, if applicable.
 3. Apply `database/migrations/001_job_leases.sql` once with `psql` and
    `ON_ERROR_STOP=1`, against the application's database/schema.
+   Also apply `database/migrations/002_sync_rate_limit.sql` for the Sync rate
+   limiter; see [sync-rate-limit.md](sync-rate-limit.md) for its settings.
 4. Start the new application. The first queue polls recover expired rows.
 
 `Base.metadata.create_all()` only creates missing tables; it does not migrate

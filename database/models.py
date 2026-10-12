@@ -10,6 +10,12 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 class Base(DeclarativeBase):
     pass
 
+class SyncRateLimit(Base):
+    __tablename__ = "sync_rate_limits"
+
+    scope: Mapped[str] = mapped_column(String(32), primary_key=True)
+    next_allowed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
 class ExtractionStatus(str, enum.Enum):
     UPLOADED = "uploaded"
     OCR_PROCESSING = "ocr_processing"

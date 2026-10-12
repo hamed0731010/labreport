@@ -35,6 +35,7 @@ sys.modules['src.service.lm_caller_client'].LmCallerClient = Mock()
 
 from src.database.models import Base
 from src.service import job_leases
+from src.service import sync_rate_limit
 from src.workers import tasks
 
 
@@ -54,6 +55,7 @@ async def db(monkeypatch):
             await conn.run_sync(Base.metadata.create_all)
         monkeypatch.setattr(job_leases, 'AsyncSessionLocal', sessions)
         monkeypatch.setattr(tasks, 'AsyncSessionLocal', sessions)
+        monkeypatch.setattr(sync_rate_limit, 'AsyncSessionLocal', sessions)
         yield sessions
     finally:
         await engine.dispose()
