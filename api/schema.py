@@ -38,5 +38,6 @@ class ExtractionStatusResponse(BaseModel):
     retry_count: int
     created_at: datetime
     updated_at: datetime
+    next_retry_at: datetime | None = None
     llm_queue_position: int | None = None
     message: str | None = None

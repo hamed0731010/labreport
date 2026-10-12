@@ -1,7 +1,6 @@
 import asyncio
 import logging
 
-from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import cv2
@@ -10,10 +9,14 @@ import numpy as np
 import si24.rulebased_labrows_parser
 import si24.ocr_row_detector
 
-from sqlalchemy import select
+from sqlalchemy import select, or_
 from sqlalchemy.exc import SQLAlchemyError
 
-from src.core.config import LLM_BASE_URL, MAX_JOB_RETRIES
+from src.core.config import LLM_BASE_URL
+from src.service.job_leases import (
+    assign_lease, clear_lease, heartbeat, mark_job_failed,
+    owns_lease, stop_heartbeat, utc_now,
+)
 from src.database.connection import AsyncSessionLocal
 from src.database.models import (
     ExtractionRequest,
@@ -28,22 +31,6 @@ from src.service.minio_storage import image_storage
 
 
 logger = logging.getLogger(__name__)
-
-MAX_JOBS_PER_DRAIN = 20
-RETRY_BASE_SECONDS = 10
-RETRY_MAX_SECONDS = 300
-
-
-def utc_now():
-    return datetime.now(timezone.utc)
-
-
-def retry_delay(retry_count: int) -> int:
-    return min(
-        RETRY_BASE_SECONDS * (2 ** max(0, retry_count - 1)),
-        RETRY_MAX_SECONDS,
-    )
-
 
 def stringify_ocr_rows(rows):
     return "\n".join(
@@ -199,10 +186,11 @@ async def _claim_job(
 
                 job.status = processing_status
                 job.updated_at = utc_now()
+                token = assign_lease(job)
 
                 job_id = job.id
 
-            return job_id
+            return job_id, token
 
     except (SQLAlchemyError, OSError):
         logger.exception(
@@ -224,7 +212,9 @@ async def task_process_ocr():
             ExtractionRequest.status
             == ExtractionStatus.UPLOADED
         )
-        .where(ExtractionRequest.updated_at <= now)
+        .where(ExtractionRequest.queue_managed.is_(True))
+        .where(or_(ExtractionRequest.next_retry_at.is_(None),
+                   ExtractionRequest.next_retry_at <= now))
         .order_by(
             ExtractionRequest.created_at.asc(),
             ExtractionRequest.id.asc(),
@@ -233,18 +223,20 @@ async def task_process_ocr():
         .with_for_update(skip_locked=True)
     )
 
-    job_id = await _claim_job(
+    claim = await _claim_job(
         stmt,
         ExtractionStatus.OCR_PROCESSING,
         "OCR",
     )
 
-    if job_id == "retry":
+    if claim == "retry":
         return "retry"
 
-    if job_id is None:
+    if claim is None:
         return "empty"
 
+    job_id, token = claim
+    lease_task = asyncio.create_task(heartbeat(job_id, token))
     try:
         logger.info(
             "[OCR] Starting job %s",
@@ -296,7 +288,7 @@ async def task_process_ocr():
                     )
                 ).scalar_one()
 
-                if job.status != ExtractionStatus.OCR_PROCESSING:
+                if not owns_lease(job, token, ExtractionStatus.OCR_PROCESSING):
                     logger.warning(
                         "[OCR] Job %s status changed; "
                         "skipping result",
@@ -354,6 +346,8 @@ async def task_process_ocr():
                         job_id,
                     )
 
+                clear_lease(job)
+                job.next_retry_at = None
                 job.updated_at = utc_now()
                 job.last_error_message = None
 
@@ -376,9 +370,13 @@ async def task_process_ocr():
             job_id,
             str(error),
             ExtractionStatus.UPLOADED,
+            token,
         )
 
         return "retry"
+    finally:
+        await stop_heartbeat(lease_task)
+
 # ==========================================
 # Task 2: Process one queued LLM job (OCR Completed -> Completed)
 # ==========================================
@@ -394,7 +392,10 @@ async def task_process_llm(eligible_before=None):
             == ExtractionStatus.OCR_COMPLETED
         )
         .where(ExtractionRequest.use_lm.is_(True))
+        .where(ExtractionRequest.queue_managed.is_(True))
         .where(ExtractionRequest.updated_at <= cutoff)
+        .where(or_(ExtractionRequest.next_retry_at.is_(None),
+                   ExtractionRequest.next_retry_at <= cutoff))
         .order_by(
             ExtractionRequest.updated_at.asc(),
             ExtractionRequest.id.asc(),
@@ -403,18 +404,20 @@ async def task_process_llm(eligible_before=None):
         .with_for_update(skip_locked=True)
     )
 
-    job_id = await _claim_job(
+    claim = await _claim_job(
         stmt,
         ExtractionStatus.LM_PROCESSING,
         "LLM",
     )
 
-    if job_id == "retry":
+    if claim == "retry":
         return "retry"
 
-    if job_id is None:
+    if claim is None:
         return "empty"
 
+    job_id, token = claim
+    lease_task = asyncio.create_task(heartbeat(job_id, token))
     try:
         logger.info("[LLM] Starting job %s", job_id)
 
@@ -526,7 +529,7 @@ async def task_process_llm(eligible_before=None):
                     )
                 ).scalar_one()
 
-                if job.status != ExtractionStatus.LM_PROCESSING:
+                if not owns_lease(job, token, ExtractionStatus.LM_PROCESSING):
                     logger.warning(
                         "[LLM] Job %s status changed; "
                         "skipping result",
@@ -553,6 +556,8 @@ async def task_process_llm(eligible_before=None):
                 response.result_json = result_json
                 response.raw_llm_output = str(llm_data)
 
+                clear_lease(job)
+                job.next_retry_at = None
                 job.status = ExtractionStatus.COMPLETED
                 job.updated_at = utc_now()
                 job.retry_count = 0
@@ -585,87 +590,9 @@ async def task_process_llm(eligible_before=None):
             job_id,
             str(error),
             ExtractionStatus.OCR_COMPLETED,
+            token,
         )
 
         return "retry"
-
-    
-async def mark_job_failed(
-    job_id: int,
-    error_msg: str,
-    fallback_status: ExtractionStatus,
-):
-    """Record a failure and schedule a delayed retry."""
-
-    try:
-        async with AsyncSessionLocal() as session:
-
-            async with session.begin():
-
-                job = (
-                    await session.execute(
-                        select(ExtractionRequest)
-                        .where(ExtractionRequest.id == job_id)
-                        .with_for_update()
-                    )
-                ).scalar_one_or_none()
-
-                if job is None:
-                    return
-
-                if job.status not in (
-                    ExtractionStatus.OCR_PROCESSING,
-                    ExtractionStatus.LM_PROCESSING,
-                ):
-                    return
-
-                # Only update the expected processing stage.
-                expected_status = (
-                    ExtractionStatus.OCR_PROCESSING
-                    if fallback_status == ExtractionStatus.UPLOADED
-                    else ExtractionStatus.LM_PROCESSING
-                )
-
-                if job.status != expected_status:
-                    return
-
-                job.retry_count = min(
-                    job.retry_count + 1,
-                    MAX_JOB_RETRIES,
-                )
-
-                job.last_error_message = error_msg
-
-                if job.retry_count >= MAX_JOB_RETRIES:
-
-                    job.status = ExtractionStatus.FAILED
-                    job.updated_at = utc_now()
-
-                    logger.error(
-                        "[Queue] Job %s permanently failed",
-                        job_id,
-                    )
-
-                else:
-                    delay = retry_delay(job.retry_count)
-
-                    job.status = fallback_status
-
-                    # Temporarily reuse updated_at
-                    # as the next eligible processing time.
-                    job.updated_at = (
-                        utc_now()
-                        + timedelta(seconds=delay)
-                    )
-
-                    logger.warning(
-                        "[Queue] Job %s will retry in %ss",
-                        job_id,
-                        delay,
-                    )
-
-    except (SQLAlchemyError, OSError):
-        logger.exception(
-            "[Queue] Failed to record error for job %s",
-            job_id,
-        )
+    finally:
+        await stop_heartbeat(lease_task)
